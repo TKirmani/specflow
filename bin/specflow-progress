@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""specflow-progress — at-a-glance progress view over spec-kit tasks.md files.
+
+Reads specs/*/tasks.md, groups checkbox tasks by phase (## / ### headers),
+prints a per-feature summary. With --watch, refreshes on file changes.
+
+Called indirectly via 'specflow progress'. No dependencies beyond Python 3 stdlib.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import time
+from pathlib import Path
+
+TASK_RE = re.compile(r"^\s*-\s*\[([ xX])\]\s*(.*)$")
+HEADER_RE = re.compile(r"^(#{2,6})\s+(.*)$")
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+
+
+def parse_tasks(path: Path):
+    """Return ordered list of (phase, done, total) for one tasks.md."""
+    phases: dict[str, list[int]] = {}
+    order: list[str] = []
+    current = "(no phase)"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        mh = HEADER_RE.match(line)
+        if mh:
+            current = mh.group(2).strip()
+            if current not in phases:
+                phases[current] = [0, 0]
+                order.append(current)
+            continue
+        mt = TASK_RE.match(line)
+        if mt:
+            done = mt.group(1).lower() == "x"
+            bucket = phases.setdefault(current, [0, 0])
+            if current not in order:
+                order.append(current)
+            bucket[1] += 1
+            if done:
+                bucket[0] += 1
+    return [(p, phases[p][0], phases[p][1]) for p in order if phases[p][1] > 0]
+
+
+def bar(done: int, total: int, width: int = 20) -> str:
+    if total == 0:
+        return " " * width
+    filled = int(round(width * done / total))
+    return "█" * filled + "░" * (width - filled)
+
+
+def render(root: Path) -> str:
+    specs_dir = root / "specs"
+    if not specs_dir.is_dir():
+        return f"{YELLOW}No specs/ directory found at {root}{RESET}\n"
+    features = sorted(p for p in specs_dir.iterdir() if p.is_dir())
+    if not features:
+        return f"{DIM}specs/ is empty — run /speckit.specify first{RESET}\n"
+
+    lines = []
+    grand_done = grand_total = 0
+    for feat in features:
+        tasks_md = feat / "tasks.md"
+        if not tasks_md.is_file():
+            lines.append(f"{BOLD}{feat.name}{RESET}  {DIM}(no tasks.md){RESET}")
+            continue
+        phases = parse_tasks(tasks_md)
+        total = sum(t for _, _, t in phases)
+        done = sum(d for _, d, _ in phases)
+        grand_done += done
+        grand_total += total
+        pct = (100 * done // total) if total else 0
+        color = GREEN if done == total and total > 0 else BLUE
+        lines.append(
+            f"{BOLD}{feat.name}{RESET}  {color}{bar(done, total)}{RESET} "
+            f"{done}/{total} ({pct}%)"
+        )
+        for phase, pd, pt in phases:
+            ppct = (100 * pd // pt) if pt else 0
+            mark = "✓" if pd == pt else " "
+            lines.append(f"  {mark} {phase:<40} {pd}/{pt} ({ppct}%)")
+        lines.append("")
+
+    if grand_total:
+        gpct = 100 * grand_done // grand_total
+        lines.append(
+            f"{BOLD}TOTAL{RESET}  {bar(grand_done, grand_total)} "
+            f"{grand_done}/{grand_total} ({gpct}%)"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def snapshot(root: Path) -> tuple:
+    """Cheap change-detection: mtimes of every tasks.md under specs/."""
+    specs = root / "specs"
+    if not specs.is_dir():
+        return ()
+    out = []
+    for feat in sorted(specs.iterdir()):
+        tm = feat / "tasks.md"
+        if tm.is_file():
+            try:
+                out.append((str(tm), tm.stat().st_mtime_ns))
+            except OSError:
+                pass
+    return tuple(out)
+
+
+def watch(root: Path, interval: float) -> None:
+    last = None
+    try:
+        while True:
+            cur = snapshot(root)
+            if cur != last:
+                sys.stdout.write("\033[2J\033[H")
+                sys.stdout.write(
+                    f"{DIM}specflow progress --watch  ({time.strftime('%H:%M:%S')}){RESET}\n\n"
+                )
+                sys.stdout.write(render(root))
+                sys.stdout.flush()
+                last = cur
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="specflow progress",
+        description="Report task completion across specs/*/tasks.md",
+    )
+    ap.add_argument("--watch", action="store_true", help="re-render on tasks.md changes")
+    ap.add_argument("--interval", type=float, default=1.0, help="watch poll interval in seconds (default 1.0)")
+    ap.add_argument("--root", type=Path, default=Path.cwd(), help="project root (default: cwd)")
+    args = ap.parse_args()
+
+    if args.watch:
+        watch(args.root, args.interval)
+    else:
+        sys.stdout.write(render(args.root))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
